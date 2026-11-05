@@ -1,0 +1,9 @@
+{
+  "name": "kartkowka-fake-news-klasa-6",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vercel dev"
+  }
+}

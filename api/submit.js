@@ -4,8 +4,44 @@ import { createHmac, timingSafeEqual } from 'node:crypto';
 const thresholds = [[100,'6'],[95,'6-'],[89,'5+'],[83,'5'],[78,'5-'],[73,'4+'],[67,'4'],[62,'4-'],[57,'3+'],[51,'3'],[46,'3-'],[41,'2+'],[35,'2'],[30,'2-'],[25,'1+'],[0,'1']];
 const normalized = name => name.normalize('NFKC').trim().replace(/\s+/g, ' ').toLocaleLowerCase('pl-PL');
 const safe = str => String(str).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const selectedLabels = (q, a) => a.map(n => q.options[n]).join('; ');
-const isValid = (q, a) => Array.isArray(a) && a.length >= 1 && a.length <= q.options.length && a.every(x => Number.isInteger(x) && x>=0 && x<q.options.length) && new Set(a).size===a.length && (q.type==='multi' || a.length===1);
+const ntext = s=>String(s).normalize('NFKC').trim().toLocaleLowerCase('pl-PL').replace(/\s+/g,' ');
+const valid = (q,a)=> {
+ if(['single','short'].includes(q.type))return typeof a==='string' && a.length<=120;
+ if(['multi','identify'].includes(q.type))return Array.isArray(a)&&a.length>=1&&a.length<=(q.options||q.parts).length;
+ if(['match','order','classify','fill','tfgrid'].includes(q.type))return Array.isArray(a)&&a.length===(q.items||q.left||q.choices||[]).length&&a.every(Number.isInteger);
+ return false;
+};
+const check=(q,a)=>{
+ if(q.type==='short')return q.correct.some(x=>ntext(x)===ntext(a));
+ if(q.type==='single')return a===String(q.correct);
+ if(['multi','identify'].includes(q.type))return JSON.stringify([...a].sort((x,y)=>x-y))===JSON.stringify([...q.correct].sort((x,y)=>x-y));
+ return JSON.stringify(a)===JSON.stringify(q.correct);
+};
+const label=(q,a)=>{
+ if(q.type==='short')return String(a||'(brak)');
+ if(q.type==='single')return q.options[Number(a)]||'(brak)';
+ if(q.type==='multi')return a.map(i=>q.options[i]).join('; ');
+ if(q.type==='identify')return a.map(i=>q.parts[i]).join('; ');
+ if(q.type==='match')return q.left.map((x,i)=>x+' → '+(q.right[a[i]]||'?')).join(' | ');
+ if(q.type==='order')return a.map(i=>q.items[i]).join(' → ');
+ if(q.type==='classify')return q.items.map((x,i)=>x+' → '+(q.categories[a[i]]||'?')).join(' | ');
+ if(q.type==='fill')return a.map((v,i)=>q.choices[i][v]||'?').join('; ');
+ if(q.type==='tfgrid')return a.map((v,i)=>q.items[i]+' — '+(v===1?'Prawda':'Fałsz')).join(' | ');
+ return '';
+};
+const solution=q=> q.type==='short'?q.display:label(q,q.type==='single'?String(q.correct):q.correct);
+const complete=(q,a)=>{
+ if(!valid(q,a))return false;
+ if(q.type==='single')return /^\d+$/.test(a) && +a<q.options.length;
+ if(q.type==='short')return a.trim().length>=1;
+ if(['multi','identify'].includes(q.type)){let len=(q.options||q.parts).length;return a.every(i=>Number.isInteger(i)&&i>=0&&i<len)&&new Set(a).size===a.length;}
+ if(q.type==='order')return a.every(i=>i>=0&&i<q.items.length)&&new Set(a).size===a.length;
+ if(q.type==='match')return a.every(i=>i>=0&&i<q.right.length)&&new Set(a).size===a.length;
+ if(q.type==='fill')return a.every((i,j)=>i>=0&&i<q.choices[j].length);
+ if(q.type==='classify')return a.every(i=>i>=0&&i<q.categories.length);
+ if(q.type==='tfgrid')return a.every(i=>i===0||i===1);
+ return false;
+};
 
 async function redis(command) {
   const url=process.env.UPSTASH_REDIS_REST_URL, token=process.env.UPSTASH_REDIS_REST_TOKEN;
@@ -25,15 +61,15 @@ export default async function handler(req, res) {
   if (!key) return res.status(503).json({error:'Nauczyciel nie skonfigurował wysyłania wyników. Skontaktuj się z nauczycielem.'});
   const {student, answers}=req.body || {};
   if (typeof student!=='string' || student.length>100 || !/^[\p{L}][\p{L} .'-]{2,99}$/u.test(student.trim()) || normalized(student).split(' ').length<2) return res.status(400).json({error:'Podaj poprawne imię i nazwisko.'});
-  if (!Array.isArray(answers) || answers.length!==questions.length || !answers.every((a,i)=>isValid(questions[i],a))) return res.status(400).json({error:'Odpowiedzi są niekompletne lub niepoprawne.'});
-  const result=questions.map((q,i)=>{const ans=[...answers[i]].sort((a,b)=>a-b);const correct=[...q.correct].sort((a,b)=>a-b);const ok=JSON.stringify(ans)===JSON.stringify(correct);return {id:q.id,question:q.question,answer:selectedLabels(q,ans),correctAnswer:selectedLabels(q,correct),earned:ok?q.points:0,points:q.points,correct:ok};});
+  if (!Array.isArray(answers) || answers.length!==questions.length || !answers.every((a,i)=>complete(questions[i],a))) return res.status(400).json({error:'Odpowiedzi są niekompletne lub niepoprawne.'});
+  const result=questions.map((q,i)=>{const a=answers[i];const ok=check(q,a);return {id:q.id,question:q.question,answer:label(q,a),correctAnswer:solution(q),earned:ok?q.points:0,points:q.points,correct:ok};});
   const points=result.reduce((s,r)=>s+r.earned,0), percent=Math.round(100*points/totalPoints), grade=thresholds.find(([min])=>percent>=min)[1];
   const cleanName=student.trim().replace(/\s+/g,' ');
   const locking=Boolean(process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN);
   let lockKey, lockValue;
   if (locking) {
     // Jeden zapis na nazwę ucznia w ramach tej kartkówki. Niezależnie od urządzenia/przeglądarki.
-    lockKey='quiz:fake-news-6b-2026-11-06:'+createHmac('sha256',key).update(normalized(cleanName)).digest('hex');
+    lockKey='quiz:fake-news-6b-2026-11-06:interactive-v3:'+createHmac('sha256',key).update(normalized(cleanName)).digest('hex');
     lockValue=cryptoRandomId();
     try {
       const locked=await redis(['SET',lockKey,lockValue,'NX','EX',60]);
